@@ -126,6 +126,22 @@ export const ruleOriginDefinitions: readonly RuleOriginDefinition[] = [
     allowedEvents: ["Purchase"],
   },
   {
+    // Porte do SaaS e279af76: mesmo modelo da automação do Unnichat (uma URL
+    // por regra/evento); o location.id do Workflow diz de qual número
+    // GoHighLevel ela é. Só conta o contato que veio de anúncio.
+    id: "automation_gohighlevel",
+    kind: "provider",
+    label: "Etapa no GoHighLevel",
+    description:
+      "Quando uma etapa do Workflow do GoHighLevel chama a URL da regra (ação Webhook), em qualquer localização conectada.",
+    logoProvider: "gohighlevel",
+    fallbackChannelProviders: ["gohighlevel"],
+    connection: "provider_anchor",
+    // Lead qualificado primeiro (padrão): uma regra "Lead recebido" pode
+    // substituir o envio da entrada, então nunca é o padrão.
+    allowedEvents: ["QualifiedLead", "Purchase", "LeadSubmitted"],
+  },
+  {
     id: "automation_payt",
     kind: "provider",
     label: "Venda na Payt",
@@ -141,6 +157,7 @@ export const ruleOriginDefinitions: readonly RuleOriginDefinition[] = [
       "unnichat",
       "waha",
       "roichat",
+      "gohighlevel",
     ],
     connection: "any",
     // O evento vem do status de cada venda; o valor vem da própria venda.
@@ -164,6 +181,7 @@ export const ruleOriginDefinitions: readonly RuleOriginDefinition[] = [
       "unnichat",
       "waha",
       "roichat",
+      "gohighlevel",
     ],
     connection: "any",
     // O evento vem do status de cada venda; o valor vem da própria venda.
@@ -188,6 +206,7 @@ export const ruleOriginDefinitions: readonly RuleOriginDefinition[] = [
       "unnichat",
       "waha",
       "roichat",
+      "gohighlevel",
     ],
     connection: "any",
     // O evento vem do campo `event` de cada aviso; o valor (só os produtos)
@@ -215,6 +234,7 @@ export const ruleOriginDefinitions: readonly RuleOriginDefinition[] = [
       "unnichat",
       "waha",
       "roichat",
+      "gohighlevel",
     ],
     connection: "any",
     allowedEvents: [...webhookEventNames],
@@ -337,6 +357,7 @@ export function hubProviderForInbound(
     case "meta_cloud":
     case "waha":
     case "roichat":
+    case "gohighlevel":
       return provider;
     default:
       return null;
@@ -367,6 +388,8 @@ export function providerDisplayName(provider: string): string {
       return "Unnichat";
     case "roichat":
       return "ROI Chat";
+    case "gohighlevel":
+      return "GoHighLevel";
     default:
       return provider;
   }
@@ -383,10 +406,12 @@ export function crmManageHref(origin: CrmRuleOrigin): string {
  */
 export function automationPlatformOf(origin: string): string {
   if (origin === "automation_roichat") return "do ROI Chat";
+  if (origin === "automation_gohighlevel") return "do GoHighLevel";
   return origin === "automation_umbler" ? "da Umbler" : "do Unnichat";
 }
 
 export function automationPlatformIn(origin: string): string {
   if (origin === "automation_roichat") return "no ROI Chat";
+  if (origin === "automation_gohighlevel") return "no GoHighLevel";
   return origin === "automation_umbler" ? "na Umbler" : "no Unnichat";
 }
