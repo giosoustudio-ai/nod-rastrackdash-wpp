@@ -25,6 +25,7 @@ import {
 import type { ParsedUmblerAutomationV1 } from "./providers/umbler/umbler-automation-v1.parser";
 import type { ParsedUnnichatAutomationV1 } from "./providers/unnichat/unnichat-automation-v1.parser";
 import type { ParsedGoHighLevelAutomationV1 } from "./providers/gohighlevel/gohighlevel-automation-v1.parser";
+import { goHighLevelStageMatches } from "./providers/gohighlevel/gohighlevel-automation-v2.parser";
 
 /**
  * Fase 5.3 — roteador das URLs únicas (SaaS 613beb3 + 4cad4963).
@@ -61,6 +62,9 @@ const routingRuleSelect = {
   removedAt: true,
   createdAt: true,
   productFilterCodes: true,
+  ghlPipelineId: true,
+  ghlStageId: true,
+  ghlStageName: true,
   conversionRule: {
     select: { triggerType: true, eventName: true, active: true },
   },
@@ -72,7 +76,87 @@ const routingRuleSelect = {
 export type RoutingRule = ScopedProviderRule & {
   createdAt: Date;
   productFilterCodes: string[];
+  /** GoHighLevel "Pipeline + etapa" filter (null = every stage). */
+  ghlPipelineId?: string | null;
+  ghlStageId?: string | null;
+  ghlStageName?: string | null;
 };
+
+/**
+ * Current GHL stage names by saved stage id (GoHighLevelPipelinesService):
+ * the same source the ingestion uses, so a stage renamed in GHL still routes.
+ */
+export type GoHighLevelStageNameSource = {
+  warmStageNames(workspaceId: string, connectionId: string): Promise<void>;
+  peekStageName(
+    connectionId: string,
+    pipelineId: string,
+    stageId: string,
+  ): string | null;
+};
+
+/**
+ * Rules with the stage name the call is compared with: the CURRENT name by
+ * the saved stage id when known, else the saved name (as the ingestion).
+ */
+export async function withCurrentGoHighLevelStageNames<R extends RoutingRule>(
+  rules: readonly R[],
+  workspaceId: string,
+  stageNames: GoHighLevelStageNameSource | undefined,
+): Promise<R[]> {
+  if (!stageNames) return [...rules];
+  const connections = new Set(
+    rules
+      .filter((rule) => rule.ghlPipelineId && rule.ghlStageId && rule.connectionId)
+      .map((rule) => rule.connectionId!),
+  );
+  for (const connectionId of connections) {
+    try {
+      await stageNames.warmStageNames(workspaceId, connectionId);
+    } catch {
+      // Never blocks the routing: the saved name stays the fallback.
+    }
+  }
+  return rules.map((rule) => {
+    if (!rule.ghlPipelineId || !rule.ghlStageId || !rule.connectionId) return rule;
+    const current = stageNames.peekStageName(
+      rule.connectionId,
+      rule.ghlPipelineId,
+      rule.ghlStageId,
+    );
+    return current ? { ...rule, ghlStageName: current } : rule;
+  });
+}
+
+/**
+ * GoHighLevel on the single URL: the rules a call may go to (pure, no I/O).
+ *  - A call that carries a pipeline stage, when the event has stage rules,
+ *    only goes to the stage rules that match it: a rule without a filter
+ *    never takes the other stages (it would send every stage change as the
+ *    event). No match = "stage_without_rule" (unattributed, visible).
+ *  - A call without a stage only goes to rules without a filter; when only
+ *    stage rules exist it is "stage_without_rule" too, never ignored.
+ *  - Two stage rules of the same tier for the call are held ("unifique").
+ */
+export function goHighLevelRoutingCandidates<R extends RoutingRule>(
+  rules: readonly R[],
+  call: { pipelineId: string | null; pipelineStage: string | null },
+):
+  | { status: "rules"; rules: R[]; holdTies: boolean }
+  | { status: "unattributed"; reasonCode: "stage_without_rule" } {
+  const isStageRule = (rule: R) => Boolean(rule.ghlPipelineId && rule.ghlStageName);
+  const stageRules = rules.filter(isStageRule);
+  const open = rules.filter((rule) => !isStageRule(rule));
+  const callHasStage = Boolean(call.pipelineId && call.pipelineStage);
+  if (callHasStage && stageRules.length > 0) {
+    const matching = stageRules.filter((rule) => goHighLevelStageMatches(rule, call));
+    return matching.length > 0
+      ? { status: "rules", rules: matching, holdTies: true }
+      : { status: "unattributed", reasonCode: "stage_without_rule" };
+  }
+  if (open.length > 0) return { status: "rules", rules: open, holdTies: false };
+  return { status: "unattributed", reasonCode: "stage_without_rule" };
+}
 
 export type IntegrationRouteDecision =
   | {
@@ -142,7 +226,11 @@ export async function loadRoutingRules(
       parserRelease: {
         is: {
           provider: input.provider,
-          version: "automation-v1",
+          // GoHighLevel: the opportunity reader (automation-v2) routes too.
+          version:
+            input.provider === "gohighlevel"
+              ? { in: ["automation-v1", "automation-v2"] }
+              : "automation-v1",
           status: { not: "retired" },
         },
       },
@@ -191,6 +279,8 @@ export function pickRoutedRuleOutcome<R extends RoutingRule>(
     phoneChannels?: readonly ScopedChannel[];
     /** Sale codes; null = platform without products (no filter). */
     productCodes: readonly string[] | null;
+    /** Hold any tie of the winning tier (GoHighLevel stage rules). */
+    holdTies?: boolean;
   },
 ): RoutedRuleOutcome<R> {
   const productCodes = options.productCodes;
@@ -225,8 +315,9 @@ export function pickRoutedRuleOutcome<R extends RoutingRule>(
   // tie-break below (oldest wins); the list still warns "unifique".
   if (
     pool.length > 1 &&
-    pool.every(providerRuleIsConnectionAutomation) &&
-    pool.some((rule) => rule.crossConnectionScope === true)
+    (options.holdTies === true ||
+      (pool.every(providerRuleIsConnectionAutomation) &&
+        pool.some((rule) => rule.crossConnectionScope === true)))
   ) {
     return { status: "ambiguous", ruleIds: pool.map((rule) => rule.id) };
   }
@@ -345,12 +436,14 @@ function finishRoute(
   channels: readonly ScopedChannel[],
   originChannelId: string,
   productCodes: readonly string[] | null,
+  holdTies = false,
 ): IntegrationRouteDecision {
   const channel = channels.find((candidate) => candidate.id === originChannelId);
   if (!channel) return unattributed("origin_channel_unresolved");
   const outcome = pickRoutedRuleOutcome(rules, channel, {
     phoneChannels: samePhoneChannels(channels, channel.id),
     productCodes,
+    holdTies,
   });
   if (outcome.status === "ambiguous") {
     return unattributed("multiple_rules_for_event", channel.id);
@@ -471,17 +564,31 @@ export async function routeGoHighLevelEvent(
     workspaceId: string;
     eventName: string;
     automation: ParsedGoHighLevelAutomationV1;
+    /** Pipeline and stage of the call (opportunity triggers). */
+    stage?: { pipelineId: string | null; pipelineStage: string | null };
+    /** Current stage names (renamed stages); without it, the saved names. */
+    stageNames?: GoHighLevelStageNameSource;
     receivedAt: Date;
   },
 ): Promise<IntegrationRouteDecision> {
   const ctwaClid = input.automation.ctwaClid;
   if (!ctwaClid) return unattributed("conversation_without_ad");
-  const rules = await loadRoutingRules(client, {
+  const loaded = await loadRoutingRules(client, {
     workspaceId: input.workspaceId,
     provider: "gohighlevel",
     eventName: input.eventName,
   });
-  if (rules.length === 0) return unattributed("no_active_rule_for_event");
+  if (loaded.length === 0) return unattributed("no_active_rule_for_event");
+  const candidates = goHighLevelRoutingCandidates(
+    await withCurrentGoHighLevelStageNames(
+      loaded,
+      input.workspaceId,
+      input.stageNames,
+    ),
+    input.stage ?? { pipelineId: null, pipelineStage: null },
+  );
+  if (candidates.status === "unattributed")
+    return unattributed(candidates.reasonCode);
 
   const located = await client.inboundWebhookChannel.findMany({
     where: {
@@ -504,9 +611,10 @@ export async function routeGoHighLevelEvent(
     workspaceId: input.workspaceId,
     ctwaClid,
     phone: input.automation.phone,
-    rules,
+    rules: candidates.rules,
     channels,
     receivedAt: input.receivedAt,
+    holdTies: candidates.holdTies,
   });
 }
 
@@ -525,9 +633,11 @@ async function routeByCtwaEntry(
     rules: RoutingRule[];
     channels: ScopedChannel[];
     receivedAt: Date;
+    holdTies?: boolean;
   },
 ): Promise<IntegrationRouteDecision> {
   const { rules, channels, ctwaClid } = input;
+  const holdTies = input.holdTies === true;
   const phones = [input.phone];
   const entries = await client.conversionEventLog.findMany({
     where: {
@@ -553,7 +663,7 @@ async function routeByCtwaEntry(
       entryChannels.add(channelId);
   }
   if (entryChannels.size === 1) {
-    return finishRoute(rules, channels, [...entryChannels][0]!, null);
+    return finishRoute(rules, channels, [...entryChannels][0]!, null, holdTies);
   }
   if (entryChannels.size > 1) return unattributed("origin_channel_unresolved");
 
@@ -571,7 +681,7 @@ async function routeByCtwaEntry(
     receivedAt: input.receivedAt,
   });
   if (origins.length !== 1) return unattributed("origin_channel_unresolved");
-  return finishRoute(rules, channels, origins[0]!, null);
+  return finishRoute(rules, channels, origins[0]!, null, holdTies);
 }
 
 /** Window of the Umbler "number the contact talked to" fallback. */

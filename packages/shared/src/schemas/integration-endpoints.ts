@@ -49,7 +49,9 @@ export const integrationEndpointAutomationEvents = {
   // O contrato wpptrack.umbler.automation.v1 só conhece estas duas automações.
   umbler: ["QualifiedLead", "Purchase"],
   // GoHighLevel: ação Webhook de uma etapa do Workflow (uma URL por regra).
-  gohighlevel: ["LeadSubmitted", "QualifiedLead", "Purchase"],
+  // Todos os eventos do pixel de mensagem (vida inteira: só LeadSubmitted e
+  // QualifiedLead, pelo catálogo de eventos).
+  gohighlevel: conversionEventNameSchema.options,
 } as const;
 
 export function integrationEndpointKindFor(
@@ -193,6 +195,8 @@ export const integrationUnattributedReasons = {
     "Duas regras para o mesmo evento neste número — unifique as regras",
   location_without_number:
     "Localização do GoHighLevel sem conexão ativa nesta conta",
+  stage_without_rule:
+    "Etapa do pipeline do GoHighLevel sem regra (ou chamada sem etapa quando só há regras por etapa)",
 } as const;
 export type IntegrationUnattributedReasonDto =
   keyof typeof integrationUnattributedReasons;

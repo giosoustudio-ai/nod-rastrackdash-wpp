@@ -1,4 +1,5 @@
 import {
+  conversionEventNameSchema,
   providerConversionRuleIdempotentCreateInputSchema,
   type ProviderConversionRuleCapabilitiesDto,
 } from "@wpptrack/shared";
@@ -97,17 +98,20 @@ describe("Nova regra: origem “Etapa no GoHighLevel”", () => {
     ).not.toContain("automation_gohighlevel");
   });
 
-  it("descreve a origem e limita os eventos a Lead, lead qualificado e compra", () => {
+  it("descreve a origem e oferece todo evento do pixel de mensagem", () => {
     const definition = ruleOriginDefinition("automation_gohighlevel");
     expect(definition).toMatchObject({
       label: "Etapa no GoHighLevel",
       logoProvider: "gohighlevel",
       connection: "provider_anchor",
     });
-    expect([...(definition.allowedEvents ?? [])].sort()).toEqual([
-      "LeadSubmitted",
-      "Purchase",
+    expect([...(definition.allowedEvents ?? [])].sort()).toEqual(
+      [...conversionEventNameSchema.options].sort(),
+    );
+    expect(definition.allowedEvents?.slice(0, 3)).toEqual([
       "QualifiedLead",
+      "Purchase",
+      "LeadSubmitted",
     ]);
     expect(emptyRuleDraft("automation_gohighlevel")).toMatchObject({
       eventName: "QualifiedLead",
@@ -119,11 +123,9 @@ describe("Nova regra: origem “Etapa no GoHighLevel”", () => {
     expect(hubProviderForInbound("gohighlevel")).toBe("gohighlevel");
     expect(providerDisplayName("gohighlevel")).toBe("GoHighLevel");
     expect(singleUrlProviderFor("automation_gohighlevel")).toBe("gohighlevel");
-    expect(supportedEvents("gohighlevel")).toEqual([
-      "LeadSubmitted",
-      "QualifiedLead",
-      "Purchase",
-    ]);
+    expect([...supportedEvents("gohighlevel")].sort()).toEqual(
+      [...conversionEventNameSchema.options].sort(),
+    );
   });
 
   it("monta a regra como a do Unnichat: todas as localizações e valor fixo opcional", () => {
@@ -160,6 +162,59 @@ describe("Nova regra: origem “Etapa no GoHighLevel”", () => {
         (built as { value: unknown }).value,
       ).success,
     ).toBe(true);
+  });
+
+  it("com pipeline e etapa: valor do lead_value com reserva opcional, qualquer evento e o filtro (porte do SaaS #277)", () => {
+    const draft: RuleDraft = {
+      ...emptyRuleDraft("automation_gohighlevel"),
+      name: "Compra no GHL",
+      eventName: "Purchase",
+      averageValue: "250,00",
+      currency: "BRL",
+      connectionId: "conn_ghl_a",
+      ghlStage: {
+        pipelineId: "PIPELINE_ID_FICTICIO",
+        pipelineName: "Funil Exemplo",
+        stageId: "STAGE_ID_2",
+        stageName: "Proposta enviada",
+      },
+    };
+    const context = {
+      numbers: [ghlNumber],
+      connections: [ghlConnection],
+      capabilities,
+      singleUrl: true,
+    };
+    const built = buildRulePayload(draft, context);
+    expect(built).toMatchObject({
+      ok: true,
+      value: {
+        eventName: "Purchase",
+        defaultValueCents: 25000,
+        ghlOpportunityValue: true,
+        ghlStage: { pipelineId: "PIPELINE_ID_FICTICIO", stageName: "Proposta enviada" },
+      },
+    });
+    expect(
+      providerConversionRuleIdempotentCreateInputSchema.safeParse(
+        (built as { value: unknown }).value,
+      ).success,
+    ).toBe(true);
+    // Com etapa o valor é opcional (vem da oportunidade).
+    expect(buildRulePayload({ ...draft, averageValue: "" }, context)).toMatchObject({
+      ok: true,
+      value: { ghlOpportunityValue: true },
+    });
+    // Com etapa vale todo evento do catálogo.
+    expect(buildRulePayload({ ...draft, eventName: "AddToCart" }, context)).toMatchObject({ ok: true });
+    // Sem etapa a regra fica no leitor anterior: valor fixo obrigatório, sem
+    // campos de oportunidade e só Lead / Lead qualificado / Compra.
+    const previous = buildRulePayload({ ...draft, ghlStage: null }, context);
+    expect(previous).toMatchObject({ ok: true, value: { defaultValueCents: 25000 } });
+    expect(previous.ok && "ghlStage" in previous.value).toBe(false);
+    expect(previous.ok && "ghlOpportunityValue" in previous.value).toBe(false);
+    expect(buildRulePayload({ ...draft, ghlStage: null, averageValue: "" }, context)).toMatchObject({ ok: false });
+    expect(buildRulePayload({ ...draft, ghlStage: null, eventName: "AddToCart" }, context)).toMatchObject({ ok: false });
   });
 });
 
@@ -200,5 +255,56 @@ describe("Hub: card do GoHighLevel", () => {
       "/integrations/gohighlevel.svg",
     );
     expect(inboundWebhookProviderLabel("gohighlevel")).toBe("GoHighLevel");
+  });
+});
+
+describe("GoHighLevel: remover o token (revisão do #145)", () => {
+  it("diz que o filtro de etapa salvo continua valendo", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const source = readFileSync(
+      resolve(__dirname, "../src/app/(app)/integrations/inbound-webhook-actions.ts"),
+      "utf8",
+    );
+    expect(source).toContain(
+      "O filtro de etapa continua valendo pelo nome salvo; sem token, a lista de etapas não é atualizada.",
+    );
+    expect(source).not.toContain("valem para todas as etapas");
+  });
+});
+
+describe("GoHighLevel: editar a regra pela etapa (revisão do SaaS)", () => {
+  it("não deixa apagar a etapa de uma regra que lê a oportunidade", async () => {
+    const { providerRule, numbers, connections, capabilities } = await import("./conversions-fixtures");
+    const { buildRuleUpdatePayload, ruleEditDraft } = await import(
+      "../src/app/(app)/conversions/rule-edit"
+    );
+    const stage = {
+      pipelineId: "PIPELINE_A",
+      pipelineName: "Funil Exemplo",
+      stageId: "STAGE_1",
+      stageName: "Ganho",
+    };
+    const rule = {
+      ...providerRule({
+        id: "rule_ghl_stage",
+        triggerType: "provider_automation",
+        origin: "automation_gohighlevel",
+        eventName: "Purchase",
+        connectionId: "conn_ghl",
+        scope: "all_numbers",
+      }),
+      ghlOpportunityReader: true,
+      ghlStage: stage,
+    };
+    const draft = ruleEditDraft(rule, "automation_gohighlevel");
+    expect(draft.ghlStage).toEqual(stage);
+    const result = buildRuleUpdatePayload(
+      rule,
+      { ...draft, ghlStage: null },
+      { numbers, connections, capabilities },
+    );
+    expect(result).toMatchObject({ ok: false });
+    expect((result as { message: string }).message).toMatch(/precisa de um pipeline e uma etapa/u);
   });
 });
